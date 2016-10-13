@@ -9,8 +9,26 @@ import org.springframework.web.bind.annotation.RestController;
 public class LoadController {
 
     @RequestMapping("/load")
-    public String load() {
-        return new String("Generate some load");
+    public Load load() {
+
+        //https://caffinc.github.io/2016/03/cpu-load-generator/
+
+        long startTime = System.currentTimeMillis();
+        long duration = 1000;
+        //random load percentage
+        double load = Math.random();
+        try {
+            // Loop for the given duration
+            while (System.currentTimeMillis() - startTime < duration) {
+                // Every 100ms, sleep for the percentage of unladen time
+                if (System.currentTimeMillis() % 100 == 0) {
+                    Thread.sleep((long) Math.floor((1 - load) * 100));
+                }
+            }
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        return new Load(String.valueOf(load));
     }
 
 }
