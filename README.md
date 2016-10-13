@@ -4,5 +4,12 @@ Endpoints:
 
 * /
 * /metrics 
+* /metrics/systemload.average
+* /health
+* /load 
 
-need to create a /load endpoint that makes the cpu go mad… generate primes or something
+To make the api generate some load use /load
+
+There's a jmeter script included that can be used to hammer the api.
+
+ 
