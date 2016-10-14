@@ -1,0 +1,272 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  Hackernoon is for haxxing
+
+Mappings:
+  RegionToECSAMI:
+    ap-southeast-2:
+      AMI: ami-22a49541
+    us-west-2:
+      AMI: ami-1ccd1f7c
+  AccountSpecificParams:
+    "996056184468":
+      AccountName: tabcorp-wagering-dev
+      VpcId: vpc-93a80bf6
+      SubnetPublicA: subnet-b3e555c4
+      SubnetPublicB: subnet-e046cd85
+      SubnetPrivateA: subnet-139f3164
+      SubnetPrivateACIDR: 10.13.48.0/25
+      SubnetPrivateB: subnet-d126a7b4
+      SubnetPrivateBCIDR: 10.13.48.128/25
+      LogsBucket: tabcorp-wagering-dev-logs
+      NATGwCIDR: 52.63.202.22/32
+
+Parameters:
+  InstanceRole:
+    Type: String
+    Description: The IAM role that the Hackernoon master instance will use
+    Default: Jenken-Automation
+  HackernoonImageRepository:
+    Type: String
+    Description: The name of the Docker repository which holds the Hackernoon Docker images
+    Default: rubix-docker-dev.artifacts.tabdigital.com.au
+  MasterImageName:
+    Type: String
+    Description: The name of the Docker image for the Hackernoon master
+    Default: hackernoon-rest-service
+  MasterImageVersion:
+    Type: String
+    Description: The version tag of the jenkins master docker image in Artifactory
+    Default: latest
+  MasterInstanceType:
+    Type: String
+    Description: The EC2 instance type for the Hackernoon master
+    AllowedValues:
+      - t2.small
+      - t2.medium
+      - t2.large
+      - m3.medium
+      - c3.large
+    Default: t2.small
+  TabOriginIp:
+    Type: String
+    Description: The origin CIDR for traffic from Tab to Hackernoon
+    Default: 203.44.116.44/32
+  ArtifactoryCredsCiphertext:
+    Type: String
+    Description: The KMS-encrypted credentials that the Hackernoon nodes must use to retrieve Docker images
+    Default: AQECAHhggPTequCEJZiWje2nomwraogaydeiw6VFPgL4Kmh9JQAAAOQwgeEGCSqGSIb3DQEHBqCB0zCB0AIBADCBygYJKoZIhvcNAQcBMB4GCWCGSAFlAwQBLjARBAz2X1eBCvNtHWRHiikCARCAgZyQZTw7X2jf/nKsGHNVwLQBZK19b7vCZ/PIA68ztcN/LAby4LxuaGs9U8+3x6d0ByYtGouy9+Ng10iuR3pKRcaR2MuDt0F8Jnio5duo+wT2cCQCm9IyE7clkFYRl1eWlnC7dOHaMp52druRtdvlDovg4Y969ASH4S6JHFmvKqbOiUgg3AS5bO458aZuTW017vmXmjRm2OZSl0/AErg=
+  SSHKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: For SSH Access
+    Default: rubix_deployment
+  Route53LambdaARN:
+    Type: String
+    Description: The Lambda function to be used as a Custom Resource for DNS provisioning
+    Default: arn:aws:lambda:ap-southeast-2:996056184468:function:R53DEV-SharedServicesR53-1L06VD7XODE7W
+  DNSZone:
+    Type: String
+    Description: The DNS domain name that the ALB will be provisioned into
+    Default: dev.wagering.in.cld
+
+Resources:
+  HackernoonMasterInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    DeletionPolicy: Retain
+    Properties:
+      Path: /
+      Roles:
+      - !Ref MasterInstanceRole
+
+  HackernoonMasterCluster:
+    Type: AWS::ECS::Cluster
+
+  HackernoonMasterService:
+    Type: AWS::ECS::Service
+    DependsOn: HackernoonMasterALBListener
+    Properties:
+      Cluster: !Ref HackernoonMasterCluster
+      DesiredCount: 1
+      Role: !Ref MasterInstanceRole
+      TaskDefinition: !Ref HackernoonMasterTaskDefinition
+      LoadBalancers:
+      - ContainerPort: 8080
+        TargetGroupArn: !Ref HackernoonMasterTargetGroup
+        ContainerName: Hackernoon-Master
+  HackernoonMasterTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Volumes:
+      - Name: no-such-volume-this-is-a-placeholder
+      ContainerDefinitions:
+      - Name: Hackernoon-Master
+        Essential: true
+        Memory: 1024
+        Image: !Sub ${HackernoonImageRepository}/${MasterImageName}:${MasterImageVersion}
+        Environment:
+        - Name: AWS_REGION
+          Value: !Ref "AWS::Region"
+        - Name: CW_LOGS_GROUP
+          Value: !Ref HackernoonLogGroup
+        PortMappings:
+        - ContainerPort: 8080
+          HostPort: 0
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref HackernoonLogGroup
+            awslogs-region: !Ref "AWS::Region"
+            awslogs-stream-prefix: hackernoon
+
+  HackernoonLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+
+  HackernoonMasterLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !FindInMap [RegionToECSAMI, !Ref "AWS::Region", AMI]
+      InstanceType: !Ref MasterInstanceType
+      IamInstanceProfile: !Ref HackernoonMasterInstanceProfile
+      KeyName: !Ref SSHKeyName
+      SecurityGroups:
+      - !Ref HackernoonMasterSecurityGroup
+      UserData: !Base64
+        Fn::Sub: |
+          #!/bin/bash
+          yum update -y
+          yum install -y aws-cli
+          # put docker creds in place for accessing artifactory
+          echo ${ArtifactoryCredsCiphertext} | base64 -d > /tmp/creds
+          REGION=$( curl --silent http://169.254.169.254/latest/meta-data/placement/availability-zone | sed -e 's/[a-z]$//' )
+          AUTH_DATA=$( aws --region $REGION kms decrypt --ciphertext-blob fileb:///tmp/creds --query Plaintext --output text | base64 -d )
+          rm /tmp/creds
+          # set up the ECS config, including the docker creds
+          cat >> /etc/ecs/ecs.config <<EoConf
+          ECS_CLUSTER=${HackernoonMasterCluster}
+          ECS_ENGINE_AUTH_TYPE=dockercfg
+          ECS_ENGINE_AUTH_DATA=$AUTH_DATA
+          EoConf
+          # set up the default log driver to talk to CloudWatch
+          cat >> /etc/sysconfig/docker <<EoDC
+          OPTIONS="\$OPTIONS --log-driver=awslogs --log-opt awslogs-region=${AWS::Region} --log-opt awslogs-group=${HackernoonLogGroup}"
+          EoDC
+          stop ecs
+          start ecs
+
+  HackernoonMasterAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: 1
+        MinInstancesInService: 0
+    Properties:
+      LaunchConfigurationName: !Ref HackernoonMasterLaunchConfiguration
+      VPCZoneIdentifier:
+      - !FindInMap [AccountSpecificParams, !Ref "AWS::AccountId", SubnetPrivateA]
+      - !FindInMap [AccountSpecificParams, !Ref "AWS::AccountId", SubnetPrivateB]
+      MaxSize: 1
+      MinSize: 0
+      DesiredCapacity: 1
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName} Hackernoon Master
+          PropagateAtLaunch: true
+        - Key: Service
+          Value: FONG2
+          PropagateAtLaunch: true
+        - Key: Schedule
+          Value: Schedule=Start=07:00|mon-fri;Stop=20:00|mon-fri;Override=on
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: Development
+          PropagateAtLaunch: true
+        - Key: OwnerDescription
+          Value: Owner=devops-wagering-tech@tabcorp.com.au;Description=Hackernoon thing
+          PropagateAtLaunch: true
+        - Key: CostCentre
+          Value: 0105755-005606-506501
+          PropagateAtLaunch: true
+
+  HackernoonMasterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permit traffic from ALB to master
+      VpcId: !FindInMap [AccountSpecificParams, !Ref "AWS::AccountId", VpcId]
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 32768
+        ToPort: 61000
+        SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permit traffic from Tab and from slaves to talk to master
+      VpcId: !FindInMap [AccountSpecificParams, !Ref "AWS::AccountId", VpcId]
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: !Ref TabOriginIp
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: !FindInMap [AccountSpecificParams, !Ref "AWS::AccountId", SubnetPrivateACIDR]
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: !FindInMap [AccountSpecificParams, !Ref "AWS::AccountId", SubnetPrivateBCIDR]
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: !FindInMap [AccountSpecificParams, !Ref "AWS::AccountId", NATGwCIDR]
+
+  HackernoonMasterLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      SecurityGroups:
+      - !GetAtt [LoadBalancerSecurityGroup, GroupId]
+      Subnets:
+      - !FindInMap [AccountSpecificParams, !Ref "AWS::AccountId", SubnetPublicA]
+      - !FindInMap [AccountSpecificParams, !Ref "AWS::AccountId", SubnetPublicB]
+  HackernoonMasterALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Protocol: HTTP
+      Port: 80
+      LoadBalancerArn: !Ref HackernoonMasterLoadBalancer
+      DefaultActions:
+      - TargetGroupArn: !Ref HackernoonMasterTargetGroup
+        Type: forward
+  HackernoonMasterTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !FindInMap [AccountSpecificParams, !Ref "AWS::AccountId", VpcId]
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /health
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  HackernoonMasterDNS:
+    Type: Custom::Route53
+    Properties:
+      ServiceToken: !Ref Route53LambdaARN
+      ZoneName: !Ref DNSZone
+      ResourceRecordSet:
+        Type: CNAME
+        TTL: 300
+        Name: !Sub hackernoon.${AWS::StackName}.${DNSZone}
+        ResourceRecords:
+        - Value: !Sub ${HackernoonMasterLoadBalancer.DNSName}
+
+Outputs:
+  HackernoonALBUrl:
+    Value: !Sub http://${HackernoonMasterLoadBalancer.DNSName}/
+  HackernoonALBInternalUrl:
+    Value: !Sub http://hackernoon.${AWS::StackName}.${DNSZone}/
